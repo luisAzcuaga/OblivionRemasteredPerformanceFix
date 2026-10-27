@@ -396,6 +396,10 @@ function Set-RunConfig([string]$backupDir) {
         } catch { Step "start-up window: Save_Settings.sav not changed ($_): the game opens at the player's size first" }
     }
     if ($IniCvars.Count) {
+        # tweak mods often leave Engine.ini read-only; writing it would fail with a bare "access denied"
+        if ((Test-Path -LiteralPath $engineIni) -and (Get-Item -LiteralPath $engineIni).IsReadOnly) {
+            throw "Engine.ini is read-only ($engineIni; tweak mods often set that), so -IniCvars cannot write it: clear its read-only attribute or run without -IniCvars."
+        }
         Copy-Item -LiteralPath $engineIni -Destination $backupDir -Force
         $list += [pscustomobject]@{ backup = (Join-Path $backupDir 'Engine.ini'); target = $engineIni }
         Set-IniValues $engineIni 'SystemSettings' $IniCvars
@@ -455,6 +459,27 @@ function Get-BaseFileHash([string]$target) {
     $path = if ($e -and (Test-Path -LiteralPath $e.backup)) { $e.backup } elseif (Test-Path -LiteralPath $target) { $target } else { $null }
     if (-not $path) { return 'none' }
     Get-TextHash ([IO.File]::ReadAllText($path))
+}
+# The player's own Engine.ini settings: every key outside the two sections the game writes itself ([Core.System] paths,
+# [WindowsApplication.Accessibility]), read from the file as the player has it. They apply to every benchmark game, so
+# a run says so (2026-10-26: a tweak mod's read-only Engine.ini from a year earlier had survived a reinstall, as Steam
+# leaves Documents\My Games alone, and was in every run on that PC). $null: none.
+function Get-EngineIniTweaks {
+    $target = Join-Path $configDir 'Engine.ini'
+    $e = Get-PendingConfig | Where-Object { $_.target -eq $target } | Select-Object -First 1
+    $path = if ($e -and (Test-Path -LiteralPath $e.backup)) { $e.backup } elseif (Test-Path -LiteralPath $target) { $target } else { return $null }
+    $section = ''; $settings = 0; $sections = @(); $header = $null
+    foreach ($line in [IO.File]::ReadAllLines($path)) {
+        if (-not $header -and $line -match '^\s*;\s*(\S.*)') { $header = $Matches[1].Trim() }
+        if ($line -match '^\s*\[(.+)\]\s*$') { $section = $Matches[1]; continue }
+        if (($section -in 'Core.System', 'WindowsApplication.Accessibility') -or $line -notmatch '^\s*[^;#=\s][^=]*=') { continue }
+        $settings++
+        if ($sections -notcontains $section) { $sections += $section }
+    }
+    if (-not $settings) { return $null }
+    $t = [ordered]@{ settings = $settings; sections = $sections; readOnly = (Test-Path -LiteralPath $target) -and (Get-Item -LiteralPath $target).IsReadOnly }
+    if ($header) { $t.header = $header.Substring(0, [Math]::Min(100, $header.Length)) }
+    $t
 }
 function ConvertTo-SortedText($h) { (@($h.Keys | Sort-Object | ForEach-Object { if ($h[$_] -is [hashtable]) { "$_={$(ConvertTo-SortedText $h[$_])}" } else { "$_=$($h[$_])" } })) -join ';' }
 
@@ -2167,6 +2192,13 @@ for ($run = 1; $run -le $Runs; $run++) {
             $result.fixedSeed = $cl -match '(^|\s)-FixedSeed(\s|$)'
             if ($CpuLimit -gt 0) { $result.cpuLimit = [ordered]@{ logical = $CpuLimit; launch = "$script:CpuLimitReport"; minSpecBoxesAnswered = [OblvBench.GameWatch]::AcceptedBoxes; minSpecBoxLog = [OblvBench.GameWatch]::AcceptLog } }
             if ($script:GameLaunchArgs -contains '-FixedSeed' -and -not $result.fixedSeed -and $sessions.Count) { [void]$sessions[0].warnings.Add("-FixedSeed is not on the game's command line ($cl): its random generators were seeded from the clock") }
+        }
+        # the player's own Engine.ini settings were in this run's games too: results are not the stock game's
+        if (-not $SelfTest -and ($tweaks = Get-EngineIniTweaks)) {
+            $result.engineIni = $tweaks
+            $msg = "Engine.ini has $($tweaks.settings) setting(s) of your own in [$($tweaks.sections -join '], [')]$(if ($tweaks.header) { " ('$($tweaks.header)')" })$(if ($tweaks.readOnly) { ', read-only' }): every benchmark game ran with them, so these results are not the stock game's (a tweak mod's Engine.ini stays in Documents\My Games\Oblivion Remastered\Saved\Config\Windows after an uninstall)"
+            if ($sessions.Count) { [void]$sessions[0].warnings.Add($msg) }
+            Write-Warning $msg
         }
         $result | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $runDir 'result.json') -Encoding utf8
         Write-Report $result $runDir | Out-Host
